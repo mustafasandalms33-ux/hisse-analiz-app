@@ -42,10 +42,19 @@ def get_ticker(symbol):
 # --- Veri çekme ---
 @st.cache_data
 def get_data(ticker, start, end, interval):
-    return yf.download(ticker, start=start, end=end, interval=interval)
+    # Veri çekilirken 'auto_adjust=True' kullanarak nan sorununu azaltırız
+    data = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=True)
+    # Eksik verileri temizle
+    data = data.dropna(subset=['Close', 'Volume'])
+    return data
 
 # --- RSI hesaplama ---
 def compute_RSI(data, period=14):
+    # NaN değerlerini temizleme
+    data = data.dropna(subset=['Close'])
+    if len(data) < period:
+        return pd.Series([float('nan')] * len(data), index=data.index)
+        
     delta = data['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
@@ -54,13 +63,16 @@ def compute_RSI(data, period=14):
     return RSI
 
 # --- Hedef analizi ---
-# --- Hedef analizi ---
 def hedef_analizi(ticker, yuzdeler, data=None):
     try:
         stock = yf.Ticker(ticker)
-        fiyat = stock.fast_info['lastPrice']
-        zirve = stock.fast_info['yearHigh']
-        dip = stock.fast_info['yearLow']
+        # Hissede işlem yoksa lastPrice NaN dönebilir.
+        fiyat = stock.fast_info.get('lastPrice')
+        zirve = stock.fast_info.get('yearHigh')
+        dip = stock.fast_info.get('yearLow')
+
+        if fiyat is None or zirve is None or dip is None:
+            return None # Veri eksikse analizi yapma
 
         hedef1 = fiyat * (1 + yuzdeler[0]/100)
         hedef2 = fiyat * (1 + yuzdeler[1]/100)
@@ -96,24 +108,11 @@ def hedef_analizi(ticker, yuzdeler, data=None):
         return None
 
 def tahmini_olasilik(data):
-    # Eğer çoklu ticker indirdiyse, tek bir sütun al
-    if isinstance(data.columns, pd.MultiIndex):
-        if 'Close' in data.columns.levels[0]:
-            data = data['Close']
-        else:
-            # Close sütunu yoksa
-            return 50, 50, 0, 0, 0
-
-    # Close sütunu yoksa
+    # Gelen veriyi temizle
     if 'Close' not in data.columns:
-        if data.columns[0].lower() in ['kapanış', 'close']:
-            data.rename(columns={data.columns[0]: 'Close'}, inplace=True)
-        else:
-            # Hiçbir Close sütunu yoksa
-            return 50, 50, 0, 0, 0
-
-    data = data.dropna(subset=['Close'])
-    if data.empty:
+        return 50, 50, 0, 0, 0
+    data = data.dropna(subset=['Close', 'RSI14'])
+    if data.empty or len(data) < 60:
         return 50, 50, 0, 0, 0
 
     # Son 60 gün yükseliş yüzdesi
@@ -126,22 +125,28 @@ def tahmini_olasilik(data):
     EMA_bonus = 10 if not ema10_series.empty and close_last > ema10_series.iloc[-1] else 0
 
     # RSI sinyali
-    rsi_series = data['RSI14'].dropna() if 'RSI14' in data.columns else pd.Series([50])
-    rsi = rsi_series.iloc[-1]
+    rsi_series = data['RSI14'].dropna()
+    rsi = rsi_series.iloc[-1] if not rsi_series.empty else 50
     RSI_bonus = 5 if rsi < 30 else 0
 
     # Hacim sinyali
+    Hacim_bonus = 0
     if 'Volume' in data.columns and not data['Volume'].dropna().empty:
         vol_avg = data['Volume'].tail(5).mean()
-        Hacim_bonus = 5 if data['Volume'].iloc[-1] > vol_avg else 0
-    else:
-        Hacim_bonus = 0
+        if not pd.isna(vol_avg):
+            Hacim_bonus = 5 if data['Volume'].iloc[-1] > vol_avg else 0
 
     P_tahmin = yuzde_yukselis + EMA_bonus + RSI_bonus + Hacim_bonus
     return P_tahmin, yuzde_yukselis, EMA_bonus, RSI_bonus, Hacim_bonus
 
 # --- Tekli analiz yorum ---
 def otomatik_yorum(hedefler, data):
+    # RSI ve MA'lar için NaN kontrolü
+    data = data.dropna(subset=["RSI14", "MA20", "MA50"])
+    if data.empty:
+        st.error("RSI ve Hareketli Ortalama hesaplaması için yeterli veri yok.")
+        return
+        
     son_rsi = data["RSI14"].iloc[-1]
     ma20 = data["MA20"].iloc[-1]
     ma50 = data["MA50"].iloc[-1]
@@ -184,13 +189,18 @@ if st.button("Analiz Et"):
     ticker = get_ticker(hisse_kodu)
     interval = "1d" if zaman_dilimi=="1 Günlük" else "1wk" if zaman_dilimi=="1 Haftalık" else "1mo"
     data = get_data(ticker, start_date, end_date, interval)
-    if not data.empty:
+    if not data.empty and len(data) >= 50: # En az 50 günlük veri kontrolü
         data["MA20"] = data["Close"].rolling(20).mean()
         data["MA50"] = data["Close"].rolling(50).mean()
         data["RSI14"] = compute_RSI(data)
-        hedefler = hedef_analizi(ticker, [hedef1_yuzde, hedef2_yuzde, hedef3_yuzde])
+        hedefler = hedef_analizi(ticker, [hedef1_yuzde, hedef2_yuzde, hedef3_yuzde], data)
         if hedefler is not None:
             otomatik_yorum(hedefler, data)
+        else:
+            st.error("Hisse temel verileri (fiyat, zirve/dip) çekilemedi.")
+    else:
+        st.error("Analiz için yeterli (en az 50 günlük) Close/Volume verisi çekilemedi.")
+
 
 # --- Toplu Hisseler Analizi ---
 st.subheader("📋 Toplu Hisseler Alım Bölgesi ve Tahmini Yön")
@@ -199,6 +209,7 @@ BIST30 = ["AKBNK", "ARCLK", "ASELS", "BIMAS", "DOHOL", "EKGYO", "EREGL", "FROTO"
     "GWIND", "GUBRF", "SAHOL", "HEKTS", "KCHOL", "KOZAL", "KOZAA", "MAVI",
     "OYAKC", "PGSUS", "PETKM", "SISE", "SODA", "TAVHL", "THYAO", "TTKOM",
     "TUPRS", "ISCTR", "TCELL", "TTRAK", "ULKER", "VAKBN"]
+# ... (Diğer BIST listeleri aynı kalır)
 BIST50 = ["AKBNK", "ARCLK", "ASELS", "BIMAS", "DOHOL", "EKGYO", "EREGL", "FROTO",
     "GWIND", "GUBRF", "SAHOL", "HEKTS", "KCHOL", "KOZAL", "KOZAA", "MAVI",
     "OYAKC", "PGSUS", "PETKM", "SISE", "SODA", "TAVHL", "THYAO", "TTKOM",
@@ -215,7 +226,7 @@ BIST100 = ["AKBNK", "ARCLK", "ASELS", "BIMAS", "DOHOL", "EKGYO", "EREGL", "FROTO
            "SELEC", "SISE", "SKBNK", "SNGYO", "SODASN", "SRV", "TAVHL", "TAVHL","TOASO", "TRGYO", "TRKCM", "TSKB", "TTKOM", "TUKAS", "TUPRS", "VAKBN",
            "VESTL", "YATAS", "YKBNK", "ZOREN"]
 toplu_listeler = {"BIST30": BIST30, "BIST50": BIST50, "BIST100": BIST100}
-# --- Hisseleri temizle: BIST30 öncelikli, BIST50 ve BIST100'te tekrar edenleri çıkar ---
+
 def temizle_hisseler(BIST30, BIST50, BIST100):
     BIST50_temiz = [h for h in BIST50 if h not in BIST30]
     BIST100_temiz = [h for h in BIST100 if h not in BIST30 and h not in BIST50_temiz]
@@ -229,63 +240,78 @@ secilen_borsa = st.multiselect("Borsa Seç", options=list(toplu_listeler.keys())
 @st.cache_data
 def fetch_data_all(tickers):
     tickers_is = [t + ".IS" for t in tickers]
-    data = yf.download(tickers_is, period="3mo")["Close"]
+    # Sadece Kapanış ve Hacim çekiyoruz
+    data = yf.download(tickers_is, period="3mo", auto_adjust=True)
     return data
 
 def toplu_alim_ve_hedef(hisseler_dict, hedef_yuzdeleri=[8,15,20]):
     tum_hisseler = [h for b in hisseler_dict for h in hisseler_dict[b]]
-    close_prices = fetch_data_all(tum_hisseler)
+    df_all = fetch_data_all(tum_hisseler)
     
     sonuc_list = []
     for borsa, hisseler in hisseler_dict.items():
         if borsa not in secilen_borsa:
             continue
         for h in hisseler:
-            fiyat = close_prices[h + ".IS"].iloc[-1]
-            ma20 = close_prices[h + ".IS"].rolling(20).mean().iloc[-1]
-            ma50 = close_prices[h + ".IS"].rolling(50).mean().iloc[-1]
-            delta = close_prices[h + ".IS"].diff()
-            gain = delta.where(delta>0,0).rolling(14).mean()
-            loss = (-delta.where(delta<0,0)).rolling(14).mean()
-            rs = gain / loss
-            rsi = (100 - (100 / (1 + rs))).iloc[-1]
+            ticker_name = h + ".IS"
+            try:
+                hisse_data = pd.DataFrame({
+                    "Close": df_all["Close"][ticker_name],
+                    "Volume": df_all["Volume"][ticker_name]
+                }).dropna() # Nan olan satırları temizle
 
-            hedefler = hedef_analizi(get_ticker(h), hedef_yuzdeleri)
-            if hedefler is None:
+                if len(hisse_data) < 50: # MA ve RSI için yeterli veri kontrolü
+                    continue
+
+                fiyat = hisse_data["Close"].iloc[-1]
+                ma20 = hisse_data["Close"].rolling(20).mean().iloc[-1]
+                ma50 = hisse_data["Close"].rolling(50).mean().iloc[-1]
+                
+                # RSI hesapla ve NaN'leri temizle
+                hisse_data["RSI14"] = compute_RSI(hisse_data)
+                hisse_data = hisse_data.dropna(subset=['RSI14'])
+                
+                if hisse_data.empty:
+                    continue
+
+                rsi = hisse_data["RSI14"].iloc[-1]
+
+                hedefler = hedef_analizi(get_ticker(h), hedef_yuzdeleri)
+                if hedefler is None:
+                    continue
+
+                # Tahmini olasılık
+                P_tahmin, _, _, _, _ = tahmini_olasilik(hisse_data)
+
+                # Alım bölgesi kontrolü
+                if rsi < 30 or ma20 > ma50:
+                    if P_tahmin > 70:
+                        tahmin = f"🚀 Yüksek Yükseliş ({P_tahmin:.1f}%)"
+                    elif P_tahmin > 55:
+                        tahmin = f"📈 Hafif Yükseliş ({P_tahmin:.1f}%)"
+                    else:
+                        tahmin = f"⚠️ Nötr ({P_tahmin:.1f}%)"
+
+                    sonuc_list.append({
+                        "Hisse": h,
+                        "Borsa": borsa,
+                        "Fiyat": f"{fiyat:.2f}",
+                        "MA20": f"{ma20:.2f}",
+                        "MA50": f"{ma50:.2f}",
+                        "RSI14": f"{rsi:.1f}",
+                        "Hedef1": f"{hedefler['hedef1']:.2f}",
+                        "Hedef2": f"{hedefler['hedef2']:.2f}",
+                        "Hedef3": f"{hedefler['hedef3']:.2f}",
+                        "Durum": "Alım Bölgesi ✅",
+                        "Tahmini_Yon": tahmin
+                    })
+
+            except Exception as e:
+                # print(f"Toplu alım hatası {h}: {e}")
                 continue
 
-            # Tahmini olasılık
-            data_hisse = pd.DataFrame(close_prices[h + ".IS"])
-            data_hisse.columns = ["Close"]
-            data_hisse["RSI14"] = compute_RSI(data_hisse)
-            P_tahmin, _, _, _, _ = tahmini_olasilik(data_hisse)
-
-            if rsi < 30 or ma20 > ma50:
-                if P_tahmin > 70:
-                    tahmin = f"🔮 Yükseliş olasılığı yüksek ({P_tahmin:.1f}%)"
-                elif P_tahmin > 55:
-                    tahmin = f"🔮 Hafif Yükseliş beklenebilir ({P_tahmin:.1f}%)"
-                elif P_tahmin < 30:
-                    tahmin = f"🔮 Düşüş olasılığı yüksek ({P_tahmin:.1f}%)"
-                else:
-                    tahmin = f"🔮 Nötr/Belirsiz ({P_tahmin:.1f}%)"
-
-                sonuc_list.append({
-                    "Hisse": h,
-                    "Borsa": borsa,
-                    "Fiyat": fiyat,
-                    "MA20": ma20,
-                    "MA50": ma50,
-                    "RSI14": rsi,
-                    "Hedef1": hedefler["hedef1"],
-                    "Hedef2": hedefler["hedef2"],
-                    "Hedef3": hedefler["hedef3"],
-                    "Durum": "Alım Bölgesi ✅",
-                    "Tahmini_Yon": tahmin
-                })
-
     sonuc_df = pd.DataFrame(sonuc_list)
-    return sonuc_df.sort_values(by="RSI14")
+    return sonuc_df.sort_values(by="RSI14", key=lambda x: pd.to_numeric(x.str.replace(',', '.'), errors='coerce'))
 
 def highlight_row(row):
     if "Alım Bölgesi" in row["Durum"]:
@@ -299,61 +325,8 @@ if st.button("Toplu Alım ve Hedef Fiyatları Kontrol Et"):
         st.dataframe(df_sonuc.style.apply(highlight_row, axis=1))
     else:
         st.info("📌 Şu anda alım bölgesinde hisseler yok.")
-# --- Hızlı Toplu Tarama - Tüm BIST Hisseleri ---
-st.subheader("🚀 Hızlı Toplu Tarama - Tüm BIST Hisseleri")
 
-@st.cache_data
-def toplu_tarama(hisseler_dict):
-    tum_hisseler = [h for b in hisseler_dict for h in hisseler_dict[b]]
-    tickers_is = [h + ".IS" for h in tum_hisseler]
-    # Close ve Volume verilerini çekiyoruz
-    df_all = yf.download(tickers_is, period="3mo")
-    
-    sonuc_list = []
-    for borsa, hisseler in hisseler_dict.items():
-        for h in hisseler:
-            try:
-                # Her hisse için Close ve Volume
-                data = pd.DataFrame()
-                data['Close'] = df_all['Close'][h + ".IS"]
-                data['Volume'] = df_all['Volume'][h + ".IS"]
-                data['RSI14'] = compute_RSI(data)
 
-                # Tahmini olasılık
-                P_tahmin, _, _, _, _ = tahmini_olasilik(data)
-                fiyat = data['Close'].iloc[-1]
-                ma20 = data['Close'].rolling(20).mean().iloc[-1]
-                ma50 = data['Close'].rolling(50).mean().iloc[-1]
-
-                durum = "Alım Bölgesi ✅" if data['RSI14'].iloc[-1]<30 or ma20>ma50 else "Normal"
-                sonuc_list.append({
-                    "Hisse": h,
-                    "Borsa": borsa,
-                    "Fiyat": fiyat,
-                    "MA20": ma20,
-                    "MA50": ma50,
-                    "RSI14": data['RSI14'].iloc[-1],
-                    "Tahmini_Yuzde": P_tahmin,
-                    "Durum": durum
-                })
-            except Exception as e:
-                continue
-
-    df_sonuc = pd.DataFrame(sonuc_list)
-    df_sonuc = df_sonuc.sort_values(by="Tahmini_Yuzde", ascending=False)
-    return df_sonuc
-
-def highlight_alim(row):
-    if "Alım" in row["Durum"]:
-        return ["background-color: lightgreen"]*len(row)
-    return [""]*len(row)
-
-if st.button("Tüm Hisseleri Tara ve Sırala"):
-    df_tarama = toplu_tarama(toplu_listeler)
-    if not df_tarama.empty:
-        st.dataframe(df_tarama.style.apply(highlight_alim, axis=1))
-    else:
-        st.info("📌 Şu anda alım bölgesinde hisseler yok.")
 # --- Otomatik Güncellenen Toplu Tarama Paneli ---
 st.subheader("🚀 Otomatik Güncellenen Toplu Tarama - BIST100/50/30")
 
@@ -363,16 +336,26 @@ def otomatik_toplu_tarama(hisseler_dict):
     tickers_is = [h + ".IS" for h in tum_hisseler]
     
     # Close ve Volume verilerini çekiyoruz
-    df_all = yf.download(tickers_is, period="3mo")
+    df_all = yf.download(tickers_is, period="3mo", auto_adjust=True)
     
     sonuc_list = []
     for borsa, hisseler in hisseler_dict.items():
         for h in hisseler:
+            ticker_name = h + ".IS"
             try:
-                data = pd.DataFrame()
-                data['Close'] = df_all['Close'][h + ".IS"]
-                data['Volume'] = df_all['Volume'][h + ".IS"]
+                data = pd.DataFrame({
+                    "Close": df_all["Close"][ticker_name],
+                    "Volume": df_all["Volume"][ticker_name]
+                }).dropna() # NaN'leri temizle
+
+                if len(data) < 50: # Yeterli veri kontrolü
+                    continue
+
                 data['RSI14'] = compute_RSI(data)
+                data = data.dropna(subset=['RSI14'])
+                
+                if data.empty:
+                    continue
 
                 # Tahmini olasılık
                 P_tahmin, _, _, _, _ = tahmini_olasilik(data)
@@ -384,17 +367,18 @@ def otomatik_toplu_tarama(hisseler_dict):
                 sonuc_list.append({
                     "Hisse": h,
                     "Borsa": borsa,
-                    "Fiyat": fiyat,
-                    "MA20": ma20,
-                    "MA50": ma50,
-                    "RSI14": data['RSI14'].iloc[-1],
-                    "Tahmini_Yuzde": P_tahmin,
+                    "Fiyat": f"{fiyat:.2f}",
+                    "MA20": f"{ma20:.2f}",
+                    "MA50": f"{ma50:.2f}",
+                    "RSI14": f"{data['RSI14'].iloc[-1]:.1f}",
+                    "Tahmini_Yuzde": f"{P_tahmin:.1f}",
                     "Durum": durum
                 })
             except Exception as e:
                 continue
 
     df_sonuc = pd.DataFrame(sonuc_list)
+    df_sonuc['Tahmini_Yuzde'] = pd.to_numeric(df_sonuc['Tahmini_Yuzde'], errors='coerce')
     df_sonuc = df_sonuc.sort_values(by="Tahmini_Yuzde", ascending=False)
     return df_sonuc
 
@@ -410,31 +394,41 @@ if not df_otomatik.empty:
     st.dataframe(df_otomatik.style.apply(highlight_alim, axis=1))
 else:
     st.info("📌 Şu anda alım bölgesinde hisseler yok.")
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-
+    
+# --- Tavan İhtimali Tahmin Aracı ---
 st.title("🚀 Ertesi Gün Tavan Olasılığı Tahmin Aracı (BIST30/50/100 + Yıldız Pazar)")
-
-# --- RSI Hesaplama ---
-def compute_RSI(data, period=14):
-    delta = data['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
 
 # --- Tavan Skoru Hesaplama ---
 def tavan_skoru(data):
+    # RSI hesaplamadan önce 'Close' sütununda NaN olan satırları at
+    data = data.dropna(subset=['Close', 'Volume']) 
+    
+    # Yeterli veri yoksa (en az 2 gün) NaN dön
+    if len(data) < 50: # Ortalama ve RSI için yeterli veri
+        return 0, float('nan'), float('nan'), float('nan'), float('nan')
+        
     data["RSI14"] = compute_RSI(data)
+    
+    # RSI hesaplandıktan sonra NaN içeren ilk satırları at
+    data = data.dropna(subset=['RSI14'])
+    
+    # Tekrar kontrol
+    if data.empty or len(data) < 2:
+         return 0, float('nan'), float('nan'), float('nan'), float('nan')
+
+    # En son geçerli değerleri al
     close = data["Close"].iloc[-1]
-    prev_close = data["Close"].iloc[-2]
+    prev_close = data["Close"].iloc[-2] # Dünkü kapanış
     hacim = data["Volume"].iloc[-1]
+    
+    # Ort Hacim: Son 10 günün ortalamasını alırken
     ort_hacim = data["Volume"].tail(10).mean()
 
+    # Hesaplamalar
     fiyat_degisim = (close - prev_close) / prev_close * 100
     rsi = data["RSI14"].iloc[-1]
 
+    # ... (Skor hesaplaması aynı kalır)
     skor = 0
     if fiyat_degisim > 7:
         skor += 30
@@ -450,15 +444,7 @@ def tavan_skoru(data):
     return skor, fiyat_degisim, rsi, hacim, ort_hacim
 
 # --- Hisse Listeleri ---
-BIST30 = ["AKBNK","ARCLK","ASELS","BIMAS","DOHOL","EKGYO","EREGL","FROTO",
-          "GWIND","GUBRF","SAHOL","HEKTS","KCHOL","KOZAL","KOZAA","MAVI",
-          "OYAKC","PGSUS","PETKM","SISE","SODA","TAVHL","THYAO","TTKOM",
-          "TUPRS","ISCTR","TCELL","TTRAK","ULKER","VAKBN"]
-
-BIST50 = BIST30 + ["AKSA","AKSGY","ANHYT","AYDEM","BJKAS","DENGE","ENJSA",
-                   "GSDHO","HALKB","ISGYO","KRDMD","ORMA","OZKGY","SNGYO",
-                   "TATEN"]
-
+# ... (Hisse listeleri aynı kalır)
 MENKUL_HISSELER = ["A1CAP","A1YEN","ACSEL","ADEL","ADESE","ADGYO","AEFES","AFYON","AGESA","AGHOL",
     "AGROT","AGYO","AHGAZ","AHSGY","AKBNK","AKCNS","AKENR","AKFGY","AKFIS","AKFYE",
     "AKGRT","AKMGY","AKSA","AKSEN","AKSGY","AKSUE","AKYHO","ALARK","ALBRK","ALCAR",
@@ -524,7 +510,6 @@ MENKUL_HISSELER = ["A1CAP","A1YEN","ACSEL","ADEL","ADESE","ADGYO","AEFES","AFYON
     "XSPOR","XSTKR","XTAST","XTCRT","XTEKS","XTM25","XTMTU","XTRZM","XTUMY","XU030",
     "XU050","XU100","XUHIZ","XULAS","XUMAL","XUSIN","XUSRD","XUTEK","XUTUM","XYLDZ",
     "XYORT"]
-
 BIST100 = BIST50 + MENKUL_HISSELER
 
 
@@ -533,20 +518,28 @@ YILDIZ_PAZAR = ["ASGYO","SASA","HEKTS","KONTR","GWIND","GESAN","BIOEN","NTHOL",
                 "AKFGY","YKBNK","VESTL","TUPRS","EREGL","THYAO","AKBNK","GARAN"]
 
 borsalar = {"BIST30": BIST30, "BIST50": BIST50, "BIST100": BIST100, "Yıldız Pazar": YILDIZ_PAZAR}
-secilen = st.selectbox("Endeks Seç", list(borsalar.keys()))
+secilen = st.selectbox("Endeks Seç (Tavan Olasılığı)", list(borsalar.keys()))
 
 # --- Verileri Çek & Hesapla ---
 tickers = [h + ".IS" for h in borsalar[secilen]]
-df_all = yf.download(tickers, period="6mo")
-
+df_all = yf.download(tickers, period="6mo", auto_adjust=True) # auto_adjust ekledik
 sonuclar = []
 for h in borsalar[secilen]:
+    ticker_name = h + ".IS"
     try:
-        data = pd.DataFrame()
-        data["Close"] = df_all["Close"][h + ".IS"]
-        data["Volume"] = df_all["Volume"][h + ".IS"]
-
+        # Veri çekme ve NaN temizleme
+        data = pd.DataFrame({
+            "Close": df_all["Close"][ticker_name],
+            "Volume": df_all["Volume"][ticker_name]
+        }).dropna()
+        
+        # tavan_skoru'nu çağır
         skor, degisim, rsi, hacim, ort_hacim = tavan_skoru(data)
+
+        # Eğer tavan_skoru NaN döndürdüyse, bu hisseyi atla
+        if pd.isna(degisim) or pd.isna(rsi):
+            continue 
+            
         sonuclar.append({
             "Hisse": h,
             "Günlük % Değişim": f"{degisim:.2f}%",
@@ -556,7 +549,7 @@ for h in borsalar[secilen]:
             "Tavan Skoru": skor,
             "Tahmin": "🚀 Tavan ihtimali yüksek" if skor >= 70 else "⚠️ Normal"
         })
-    except:
+    except Exception as e:
         continue
 
 df_sonuc = pd.DataFrame(sonuclar).sort_values(by="Tavan Skoru", ascending=False)
